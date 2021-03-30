@@ -44,6 +44,29 @@ void process_crud(const char *data_file, const char *md5_file,
 /*----------------------------------------------------------------------------*/
 /*                             External Functions                             */
 /*----------------------------------------------------------------------------*/
+int writeToFile(char *db_file_path, char *data, size_t size)
+{
+	FILE *fp;
+	fp = fopen(db_file_path , "w+");
+	if (fp == NULL)
+	{
+		debug_info("Failed to open file in db %s\n", db_file_path );
+		return 0;
+	}
+	if(data !=NULL)
+	{
+		fwrite(data, size, 1, fp);
+		fclose(fp);
+		return 1;
+	}
+	else
+	{
+		debug_info("WriteToJson failed, Data is NULL\n");
+		fclose(fp);
+		return 0;
+	}
+}
+
 int process_wrp(const char *data_file, const char *md5_file,
                 wrp_msg_t *msg, wrp_msg_t *response)
 {
@@ -104,6 +127,9 @@ void process_crud(const char *data_file, const char *md5_file,
     crud_msg_t *crud_in = &(in->u.crud);
     crud_msg_t *crud_out = &(response->u.crud);
 
+    debug_info("Write received blob in file\n");
+    writeToFile("/tmp/akervalue.bin",(char *)crud_in->payload,crud_in->payload_size);
+    debug_info("After writeToFile. /tmp/akervalue.bin\n");
     /* Response struct has been initialized to 0. */
 
     payload_valid = 0;
