@@ -17,7 +17,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <stdlib.h>
-
+#include <string.h>
 #include "time.h"
 #include "aker_log.h"
 
@@ -86,15 +86,25 @@ int set_unix_time_zone (const char *time_zone)
    struct tm *mt;
    time_t mtt;
    char ftime[10];
+   char ftime2[10];
    int rv = 0;
 
-   setenv("TZ", time_zone, 1);
-   tzset();
+   if(strcmp(time_zone, "US/Pacific") != 0)
+   {
+	setenv("TZ", time_zone, 1);
+	tzset();
+   }
    mtt = time(NULL);
    mt = localtime(&mtt);
+   debug_info("mt->tm_zone = %s\n", mt->tm_zone);
+   debug_info("mt->tm_zone[0] is %c mt->tm_isdst %ld\n", mt->tm_zone[0], mt->tm_isdst);
    if (0 != mt->tm_zone[0]) {
        strftime(ftime,sizeof(ftime),"%Z %H%M",mt);
+       debug_info("ftime is %s\n", ftime);
    } else {
+        debug_error("error case set unix time\n");
+        strftime(ftime2,sizeof(ftime2),"%Z %H%M",mt);
+	debug_info("ftime2 error case is %s\n", ftime2);
        strftime(ftime,sizeof(ftime),"nil %H%M",mt);
        debug_error("set_unix_time_zone() error, TZ = %s\n", time_zone);
    }
