@@ -37,6 +37,10 @@
 #include "breakpad_wrapper.h"
 #endif
 
+#if defined(ENABLE_FEATURE_TELEMETRY2_0)
+   #include <telemetry_busmessage_sender.h>
+#endif
+#include "time.h"
 /*----------------------------------------------------------------------------*/
 /*                                   Macros                                   */
 /*----------------------------------------------------------------------------*/
@@ -51,7 +55,7 @@
 /*                            File Scoped Variables                           */
 /*----------------------------------------------------------------------------*/
 size_t max_macs = INT_MAX;
-
+static uint32_t md5_error_count = 0;
 
 /*----------------------------------------------------------------------------*/
 /*                            Global Variables                                */
@@ -68,6 +72,7 @@ static int main_loop(libpd_cfg_t *cfg, char *data_file, char *md5_file );
 /*----------------------------------------------------------------------------*/
 /*                             External Functions                             */
 /*----------------------------------------------------------------------------*/
+#define TELEMETRY_MAX_BUFFER 4096
 int main( int argc, char **argv)
 {
     const char *option_string = "p:c:w:d:f:m:h::";
@@ -96,6 +101,27 @@ int main( int argc, char **argv)
     int opt_index = 0;
     int rv = 0;
     pthread_t thread_id;
+    char telemetryBuff[TELEMETRY_MAX_BUFFER] = { '\0' };
+
+    time_t start_unix_time = 0;
+
+    debug_info("********** Starting component: aker **********\n ");
+
+    t2_init("aker");
+    debug_info("aker T2 init done\n ");
+
+    start_unix_time = get_unix_time();
+
+    debug_info("start_unix_time is %d\n", start_unix_time);
+    t2_event_d("aker_ProcessStartTime_split", start_unix_time);
+    debug_info("aker_ProcessStartTime_split t2 event triggered\n");
+
+    memset(telemetryBuff, 0, TELEMETRY_MAX_BUFFER);
+
+    strcpy(telemetryBuff, "stringTest");
+    debug_info("telemetryBuff is %s\n", telemetryBuff);
+    t2_event_s("aker_stringMarker_split", telemetryBuff);
+    debug_info("aker_stringMarker_split t2 event triggered\n");
 
     signal(SIGTERM, sig_handler);
     signal(SIGINT, sig_handler);
@@ -247,6 +273,10 @@ static void import_existing_schedule( const char *data_file, const char *md5_fil
 
     if (0 != verify_md5_signatures(data_file, md5_file)) {
         debug_error("import_existing_schedule() data or md5 corruption\n");
+	md5_error_count = md5_error_count+1 ;
+	debug_error("md5_error_count is %d\n", md5_error_count);
+	t2_event_d("aker_MD5ErrorCount_split", md5_error_count);
+	debug_info("aker_MD5ErrorCount_split t2 event triggered\n");
     }
 
     len = read_file_from_disk( data_file, &data );
