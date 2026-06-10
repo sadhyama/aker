@@ -57,6 +57,15 @@ typedef struct schedule {
 
     size_t mac_count;               /* The count of the macs. */
     mac_address *macs;              /* The shared list of mac addresses to block. */
+
+    uint32_t report_rate_s;         /* 0      = none (default)
+                                     * 3600   = 1 hour (minimum)
+                                     * 86400  = daily
+                                     * 604800 = weekly
+                                     */
+
+    time_t   pause_until;           /* UTC Unix time after which a paused
+                                     * profile should resume; 0 = not set.  */
 } schedule_t;
 
 /*----------------------------------------------------------------------------*/
@@ -101,8 +110,10 @@ schedule_event_t* create_schedule_event( size_t block_count );
  *
  *  @param head the pointer to the list head
  *  @param e    the schedule_event_t pointer to add to the list
+ *
+ *  @return 0 on success, -1 otherwise
  */
-void insert_event(schedule_event_t **head, schedule_event_t *e );
+int insert_event(schedule_event_t **head, schedule_event_t *e );
 
 
 /**

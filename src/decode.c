@@ -29,9 +29,14 @@
 #define RELATIVE_TIME_STR "time"
 #define UNIX_TIME_STR     "unix_time"
 #define INDEXES_STR       "indexes"
+#define REPORT_RATE_STR   "report_rate"
 /* Currently AKER will not do any validation on time_zone string */
 #define TIME_ZONE         "time_zone" /* REF: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones */
+#define PAUSE_UNTIL_STR   "pause_until"
 
+#ifndef MINIMUM_REPORTING_RATE
+#define MINIMUM_REPORTING_RATE 3600
+#endif
 
 
 #define UNPACKED_BUFFER_SIZE 2048
@@ -90,11 +95,17 @@ int decode_schedule(size_t len, uint8_t * buf, schedule_t **t)
             while (size-- > 0) {
                 if (0 == strncmp(key->via.str.ptr, WEEKLY_SCHEDULE, key->via.str.size)) {
                     debug_print("Found %s\n", WEEKLY_SCHEDULE);
-                    decode_schedule_table(key, val, &s->weekly);
+                    if( 0 != decode_schedule_table(key, val, &s->weekly) ) {
+                        debug_error("decode_schedule():weekly schedule error\n");
+                        ret_val = -9;
+                    }
                 }
                 else if (0 == strncmp(key->via.str.ptr, ABSOLUTE_SCHEDULE, key->via.str.size)) {
                     debug_print("Found %s\n", ABSOLUTE_SCHEDULE);
-                    decode_schedule_table(key, val, &s->absolute);
+                    if( 0 != decode_schedule_table(key, val, &s->absolute) ) {
+                        debug_error("decode_schedule():absolute schedule error\n");
+                        ret_val = -10;
+                    }
                 }
                 else if (0 == strncmp(key->via.str.ptr, MACS, key->via.str.size)) {
                     debug_print("Found %s\n", MACS);
@@ -110,8 +121,19 @@ int decode_schedule(size_t len, uint8_t * buf, schedule_t **t)
                 else if (0 == strncmp(key->via.str.ptr, TIME_ZONE, key->via.str.size)) {
                     decode_string_type(key, val, &s);
                 }
+                else if (0 == strncmp(key->via.str.ptr, REPORT_RATE_STR, key->via.str.size)) {
+                    s->report_rate_s = (uint32_t) val->via.u64;
+                    if( (0 < s->report_rate_s) &&
+                        (s->report_rate_s < MINIMUM_REPORTING_RATE) )
+                    {
+                        s->report_rate_s = MINIMUM_REPORTING_RATE;
+                    }
+                }
+                else if (0 == strncmp(key->via.str.ptr, PAUSE_UNTIL_STR, key->via.str.size)) {
+                    s->pause_until = (time_t) val->via.u64;
+                }
                 else {
-                     debug_error("decode_schedule() can't handle object %d\n", obj.type);
+                     debug_error("decode_schedule() ignoring unknown object %d\n", obj.type);
                 }
                 p++;
                 key = &p->key;
@@ -165,15 +187,20 @@ int decode_schedule_table (msgpack_object *key, msgpack_object *val, schedule_ev
         int count = val->via.array.size; 
         int i;
         schedule_event_t *temp = NULL;
-        
-        if (count <= 0) {
+
+        /* An empty list is ok, but an invalid size is an error. */
+        if (count == 0) {
+            return 0;
+        } else if (count < 0) {
             return -1;
         }
 
         if (ptr->type == MSGPACK_OBJECT_MAP) {
             for (i = 0; i < count; i++) {
                 if (0 == process_map(&ptr->via.map, &temp)) {
-                    insert_event(t, temp);
+                    if (0 != insert_event(t, temp)) {
+                        return -1;
+                    }
                 }
                 ptr++;
            }

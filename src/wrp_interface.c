@@ -15,6 +15,7 @@
  *
  */
 #include <stdio.h>
+#include <string.h>
 
 #include "aker_log.h"
 #include "wrp_interface.h"
@@ -33,6 +34,11 @@
 /*----------------------------------------------------------------------------*/
 typedef struct wrp_crud_msg crud_msg_t;
 typedef struct wrp_req_msg  req_msg_t;
+
+/*----------------------------------------------------------------------------*/
+/*                            File Scoped Variables                           */
+/*----------------------------------------------------------------------------*/
+static char s_transaction_id[64] = {0};
 
 /*----------------------------------------------------------------------------*/
 /*                             Function Prototypes                            */
@@ -76,6 +82,11 @@ int process_wrp(const char *data_file, const char *md5_file,
     }
 
     return rv;
+}
+
+const char *aker_get_transaction_id( void )
+{
+    return s_transaction_id;
 }
 
 int cleanup_wrp(wrp_msg_t *message)
@@ -127,6 +138,11 @@ void process_crud(const char *data_file, const char *md5_file,
                         tmp = process_update(data_file, md5_file,
                                                 crud_in->payload, crud_in->payload_size );
                         crud_out->status = ((0 == tmp) ? 201 : 533);
+                        if( 0 == tmp && crud_in->transaction_uuid ) {
+                            strncpy(s_transaction_id, crud_in->transaction_uuid,
+                                    sizeof(s_transaction_id) - 1);
+                            s_transaction_id[sizeof(s_transaction_id) - 1] = '\0';
+                        }
                     } else {
                         crud_out->status = 409;
                     }
@@ -159,6 +175,11 @@ void process_crud(const char *data_file, const char *md5_file,
                     tmp = process_update(data_file, md5_file, crud_in->payload,
                                             crud_in->payload_size );
                     crud_out->status = ((0 == tmp) ? 201 : 534);
+                    if( 0 == tmp && crud_in->transaction_uuid ) {
+                        strncpy(s_transaction_id, crud_in->transaction_uuid,
+                                sizeof(s_transaction_id) - 1);
+                        s_transaction_id[sizeof(s_transaction_id) - 1] = '\0';
+                    }
                 } else if( 0 == strcmp(APP_SCHEDULE_END, endpoint) ) {
                     crud_out->status = 405;
                 }

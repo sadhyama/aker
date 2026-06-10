@@ -15,7 +15,8 @@
 set(PROJ_AKER aker)
 set(SOURCES wrp_interface.c decode.c time.c schedule.c
             process_data.c scheduler.c schedule_print.c
-            aker_md5.c md5.c aker_mem.c aker_help.c aker_msgpack.c)
+            aker_md5.c md5.c aker_mem.c aker_help.c aker_msgpack.c aker_metrics.c
+            aker_notify.c)
 
 if (NOT BUILD_YOCTO)
     set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -W -g -fprofile-arcs -ftest-coverage -O0")
@@ -24,7 +25,7 @@ endif ()
 add_executable(aker main.c ${SOURCES})
 
 if (NOT BUILD_YOCTO)
-	add_executable(aker-cli cli.c ${SOURCES})
+	add_executable(aker-cli cli.c ../tests/libparodus_mock.c ${SOURCES})
 
 	target_link_libraries (aker-cli
 		${CMAKE_THREAD_LIBS_INIT}
@@ -36,7 +37,7 @@ if (NOT BUILD_YOCTO)
 		-lpthread
 		)
 	if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-	target_link_libraries (aker-cli -lrt)
+	target_link_libraries (aker-cli -lrt ${CURL_LIBRARIES})
 	endif()
 endif ()
 
