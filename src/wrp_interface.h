@@ -65,6 +65,15 @@ int process_wrp(const char *data_file, const char *md5_file,
  */
 int cleanup_wrp(wrp_msg_t *response);
 
+/**
+ *  Returns the transaction UUID captured from the most recent successful
+ *  schedule CREATE or UPDATE request.
+ *
+ *  @return pointer to internal static buffer (do not free, do not retain
+ *          across subsequent calls to process_wrp).
+ */
+const char *aker_get_transaction_id( void );
+
 #ifdef __cplusplus
 }
 #endif

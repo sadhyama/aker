@@ -63,6 +63,9 @@ typedef struct schedule {
                                      * 86400  = daily
                                      * 604800 = weekly
                                      */
+
+    time_t   pause_until;           /* UTC Unix time after which a paused
+                                     * profile should resume; 0 = not set.  */
 } schedule_t;
 
 /*----------------------------------------------------------------------------*/

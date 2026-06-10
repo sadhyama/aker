@@ -33,6 +33,7 @@
 #include "aker_mem.h"
 #include "aker_help.h"
 #include "aker_metrics.h"
+#include "aker_notify.h"
 #include "time.h"
 
 #ifdef INCLUDE_BREAKPAD
@@ -328,6 +329,7 @@ static int main_loop(libpd_cfg_t *cfg, char *data_file, char *md5_file, const ch
     }
 
     aker_metric_init(device_id, hpd_instance);
+    aker_notify_init(hpd_instance, device_id);
 
     debug_print("starting the main loop...\n");
     while( true ) {
