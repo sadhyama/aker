@@ -503,6 +503,67 @@ static mac_block_period_t* build_periods_for_mac(
 }
 
 /**
+ * Log timeline summary for debugging
+ */
+static void log_timeline_summary(mac_timeline_collection_t *collection, schedule_t *schedule)
+{
+    char start_iso[32], end_iso[32];
+    char start_soon_iso[32], end_soon_iso[32];
+    int period_count;
+
+    if (!collection || !collection->timelines || !schedule) {
+        return;
+    }
+
+    debug_info("=== Timeline Summary (%zu MACs, %d weeks) ===\n",
+               collection->mac_count, MAX_WEEKS_AHEAD);
+
+    for (size_t i = 0; i < collection->mac_count; i++) {
+        mac_block_period_t *period = collection->timelines[i].periods;
+
+        if (!period) {
+            debug_info("MAC %u (%s): No periods (indefinitely blocked or no schedule)\n",
+                       (unsigned int)i, schedule->macs[i].mac);
+            continue;
+        }
+
+        debug_info("MAC %u (%s):\n", (unsigned int)i, schedule->macs[i].mac);
+
+        period_count = 0;
+        while (period) {
+            period_count++;
+
+            /* Format period times */
+            format_iso8601_utc(period->start_time, start_iso);
+            format_iso8601_utc(period->end_time, end_iso);
+
+            debug_info("  Period %d: %s to %s\n", period_count, start_iso, end_iso);
+
+            /* Show notification times if period is long enough */
+            bool skip_soon = (period->end_time - period->start_time) < NOTIFICATION_ADVANCE_TIME_SEC;
+
+            if (!skip_soon) {
+                format_iso8601_utc(period->start_time - NOTIFICATION_ADVANCE_TIME_SEC, start_soon_iso);
+                debug_info("    STARTING_SOON at %s\n", start_soon_iso);
+            }
+
+            debug_info("    STARTED at %s\n", start_iso);
+
+            if (!skip_soon) {
+                format_iso8601_utc(period->end_time - NOTIFICATION_ADVANCE_TIME_SEC, end_soon_iso);
+                debug_info("    ENDING_SOON at %s\n", end_soon_iso);
+            }
+
+            debug_info("    ENDED at %s\n", end_iso);
+
+            period = period->next;
+        }
+    }
+
+    debug_info("=== End Timeline Summary ===\n");
+}
+
+/**
  * Build MAC-specific timeline from schedule
  */
 mac_timeline_collection_t* build_timeline_from_schedule(
@@ -633,8 +694,12 @@ mac_timeline_collection_t* build_timeline_from_schedule(
     
     /* Cleanup */
     free_timeline_events(all_events);
-    
+
     debug_info("build_timeline_from_schedule: Timeline built successfully\n");
+
+    /* Log timeline summary for debugging */
+    log_timeline_summary(collection, schedule);
+    
     return collection;
 }
 
