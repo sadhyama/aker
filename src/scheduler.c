@@ -33,6 +33,7 @@
 #include "time.h"
 #include "aker_mem.h"
 #include "aker_metrics.h"
+#include "aker_notification.h"
 
 #ifdef INCLUDE_BREAKPAD
 #include "breakpad_wrapper.h"
@@ -51,6 +52,7 @@ static char *current_blocked_macs = NULL;
 static pthread_mutex_t schedule_lock;
 static pthread_cond_t cond_var = PTHREAD_COND_INITIALIZER;
 static int report_metrics_to_log = 0;
+static mac_timeline_collection_t *notification_timeline = NULL;
 
 /*----------------------------------------------------------------------------*/
 /*                             External functions                             */
@@ -158,6 +160,7 @@ void *scheduler_thread(void *args)
     int rv = ETIMEDOUT;
     uint32_t last_report_rate = 0;
     uint32_t report_jitter = 0; /* seconds */
+    schedule_t *previous_schedule = NULL;  /* Track schedule pointer changes */
     
     signal(SIGTERM, sig_handler);
     signal(SIGINT, sig_handler);
@@ -186,9 +189,17 @@ void *scheduler_thread(void *args)
     while( __keep_going__ ) {
         int info_period = 3;
         int schedule_changed = 0;
+        int schedule_structure_changed = 0;  /* New: track schedule structure changes */
    
         pthread_mutex_lock( &schedule_lock );
         
+        /* Detect if schedule structure changed (new schedule arrived) */
+        if (current_schedule != previous_schedule) {
+            schedule_structure_changed = 1;
+            previous_schedule = current_schedule;
+            debug_info("scheduler_thread(): Schedule structure changed (new schedule received)\n");
+        }
+
         if( current_schedule ) {
             char *blocked_macs;
 
@@ -262,6 +273,42 @@ void *scheduler_thread(void *args)
             }
         }
 
+        /* Build notification timeline ONLY when schedule structure changes (new schedule received)
+         * NOT when blocking state changes (time advances) */
+        if( 0 != schedule_structure_changed ) {
+            if( notification_timeline ) {
+                destroy_timeline_collection(notification_timeline);
+                notification_timeline = NULL;
+            }
+
+            if( current_schedule ) {
+                const char *tz = current_schedule->time_zone ? current_schedule->time_zone : "UTC";
+                aker_notification_init(tz);
+
+                notification_timeline = build_timeline_from_schedule(
+                    current_schedule,
+                    current_unix_time,
+                    MAX_WEEKS_AHEAD);
+
+                if( notification_timeline ) {
+                    debug_info("scheduler_thread(): Notification timeline built successfully\n");
+                } else {
+                    debug_error("scheduler_thread(): Failed to build notification timeline\n");
+                }
+            } else {
+                /* Schedule was removed, cleanup notifications */
+                debug_info("scheduler_thread(): Schedule removed, cleaning up notifications\n");
+            }
+        }
+
+        /* Send pending notifications */
+        if( notification_timeline && current_schedule ) {
+            send_pending_notifications_with_state_check(
+                notification_timeline,
+                current_schedule,
+                current_unix_time);
+        }
+
         /* Report if it is time. */
         if( next_report_time <= current_unix_time ) {
             aker_metrics_report(current_unix_time);
@@ -283,9 +330,18 @@ void *scheduler_thread(void *args)
 
         tm.tv_sec = get_next_unixtime(current_schedule, current_unix_time);
 
-        /* Choose the earlier time of reporting or the next event. */
+        /* Choose the earlier time of reporting, next event, or next notification. */
         if( next_report_time < tm.tv_sec ) {
             tm.tv_sec = next_report_time;
+        }
+
+        /* Include notification time in wake-up calculation */
+        if( notification_timeline ) {
+            time_t next_notification = get_next_notification_time(notification_timeline, current_unix_time);
+            if( next_notification < tm.tv_sec ) {
+                tm.tv_sec = next_notification;
+                debug_info("scheduler_thread(): Next wake for notification at %ld\n", next_notification);
+            }
         }
 
         rv = pthread_cond_timedwait(&cond_var, &schedule_lock, &tm);
@@ -387,4 +443,6 @@ void cleanup (void )
     pthread_mutex_destroy(&schedule_lock);
     destroy_schedule(current_schedule);
     destroy_akermetrics();
+    destroy_timeline_collection(notification_timeline);
+    aker_notification_cleanup();
 }
