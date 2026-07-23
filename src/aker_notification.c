@@ -72,7 +72,6 @@ void format_iso8601_utc(time_t unix_time, char *output)
 void calculate_utc_offset(const char *timezone, time_t unix_time, char *output)
 {
     struct tm local_time;
-    time_t local_as_utc;
     long offset_sec;
     int hours, minutes;
     char sign;
@@ -104,15 +103,12 @@ void calculate_utc_offset(const char *timezone, time_t unix_time, char *output)
     /* Get local time in target timezone */
     local_time = *localtime(&unix_time);
     
-    /* Convert back to UTC to get offset
-     * The trick: mktime() interprets struct tm as local time,
-     * but we feed it the local_time which is already in target TZ.
-     * The difference tells us the offset.
+    /* Get UTC offset from tm structure
+     * tm_gmtoff is available on Linux/BSD/MacOS and gives the
+     * offset in seconds from UTC (negative for west of UTC)
+     * For example: PDT (UTC-7) gives tm_gmtoff = -25200
      */
-    local_as_utc = mktime(&local_time);
-    
-    /* Calculate offset in seconds */
-    offset_sec = (long)difftime(unix_time, local_as_utc);
+    offset_sec = local_time.tm_gmtoff;
     
     /* Restore original TZ */
     if (old_tz_buf[0]) {
@@ -201,6 +197,7 @@ typedef struct timeline_event {
     bool is_block_start;  /* true = block starts, false = block ends */
     uint32_t *mac_indexes;
     size_t mac_count;
+    bool is_absolute;     /* true = from absolute schedule, false = from weekly */
     struct timeline_event *next;
 } timeline_event_t;
 
@@ -211,7 +208,8 @@ static timeline_event_t* create_timeline_event(
     time_t event_time,
     bool is_block_start,
     uint32_t *mac_indexes,
-    size_t mac_count)
+    size_t mac_count,
+    bool is_absolute)
 {
     timeline_event_t *event;
     
@@ -222,6 +220,7 @@ static timeline_event_t* create_timeline_event(
     
     event->event_time = event_time;
     event->is_block_start = is_block_start;
+    event->is_absolute = is_absolute;
     event->mac_count = mac_count;
     event->next = NULL;
     
@@ -302,16 +301,23 @@ bool is_mac_indefinitely_blocked(schedule_t *schedule, uint32_t mac_index)
     
     schedule_event_t *event = schedule->weekly;
     while (event) {
+        bool mac_in_this_event = false;
+        
         /* Check if this MAC is in the blocking list */
         for (size_t i = 0; i < event->block_count; i++) {
             if (event->block[i] == mac_index) {
                 found_blocking = true;
+                mac_in_this_event = true;
                 break;
             }
         }
         
         /* Check if this is an unblock-all event (empty indexes) */
         if (event->block_count == 0) {
+            found_unblocking = true;
+        }
+        /* If event blocks other MACs but NOT this one = implicit unblock */
+        else if (!mac_in_this_event) {
             found_unblocking = true;
         }
         
@@ -330,7 +336,9 @@ static mac_block_period_t* create_block_period(
     time_t end_time,
     uint32_t *blocked_mac_indexes,
     size_t blocked_count,
-    size_t total_mac_count)
+    size_t total_mac_count,
+    bool start_is_absolute,
+    bool end_is_absolute)
 {
     mac_block_period_t *period;
     
@@ -344,6 +352,8 @@ static mac_block_period_t* create_block_period(
     period->start_time = start_time;
     period->end_time = end_time;
     period->blocked_count = blocked_count;
+    period->start_is_absolute = start_is_absolute;
+    period->end_is_absolute = end_is_absolute;
     period->next = NULL;
     
     /* Allocate and copy blocked MAC indexes */
@@ -439,11 +449,12 @@ static mac_block_period_t* build_periods_for_mac(
     timeline_event_t *current;
     time_t block_start = 0;
     bool currently_blocked = false;
-    
+    bool start_is_absolute = false;  /* Track if block START is from absolute */
+
     current = events;
     while (current) {
         bool affects_this_mac = false;
-        
+
         /* Check if this event affects our MAC */
         if (current->mac_count == 0) {
             /* Unblock-all affects everyone */
@@ -457,31 +468,105 @@ static mac_block_period_t* build_periods_for_mac(
                 }
             }
         }
-        
+
         if (!affects_this_mac) {
             current = current->next;
             continue;
         }
-        
+
         /* Process the event */
         if (current->is_block_start) {
             if (!currently_blocked) {
                 block_start = current->event_time;
                 currently_blocked = true;
+                start_is_absolute = current->is_absolute;  /* Remember if START is from absolute */
+
+                /* Check for redundant absolute events:
+                 * If this is absolute and next event is weekly at SAME time affecting this MAC,
+                 * treat as weekly (backend adds absolute for scheduling, but it's really weekly) */
+                if (start_is_absolute && current->next) {
+                    timeline_event_t *next_event = current->next;
+
+                    /* Check if next event is at same time and is a block_start */
+                    if (next_event->is_block_start &&
+                        next_event->event_time == current->event_time &&
+                        !next_event->is_absolute) {
+
+                        /* Check if next event affects this MAC */
+                        bool next_affects_mac = false;
+                        if (next_event->mac_count == 0) {
+                            next_affects_mac = true;
+                        } else {
+                            for (size_t i = 0; i < next_event->mac_count; i++) {
+                                if (next_event->mac_indexes[i] == mac_index) {
+                                    next_affects_mac = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        /* If weekly event at same time also affects this MAC, prefer weekly */
+                        if (next_affects_mac) {
+                            start_is_absolute = false;
+                            debug_info("build_periods_for_mac: MAC %u - Detected redundant absolute at %ld, treating as weekly\n",
+                                       mac_index, current->event_time);
+                        }
+                    }
+                }
             }
         } else {
             /* Block end */
             if (currently_blocked) {
                 /* Create period only if it's in the future or currently active */
                 if (current->event_time > now) {
+                    bool end_is_absolute = current->is_absolute;
+
+                    /* Check for redundant absolute unblock events:
+                     * If this is absolute and next event is weekly at SAME time affecting this MAC,
+                     * treat as weekly (backend adds absolute for scheduling, but it's really weekly) */
+                    if (end_is_absolute && current->next) {
+                        timeline_event_t *next_event = current->next;
+
+                        /* Check if next event is at same time and is also a block_end (unblock) */
+                        if (!next_event->is_block_start &&
+                            next_event->event_time == current->event_time &&
+                            !next_event->is_absolute) {
+
+                            /* Check if next event affects this MAC */
+                            bool next_affects_mac = false;
+                            if (next_event->mac_count == 0) {
+                                next_affects_mac = true;
+                            } else {
+                                for (size_t i = 0; i < next_event->mac_count; i++) {
+                                    if (next_event->mac_indexes[i] == mac_index) {
+                                        next_affects_mac = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            /* If weekly unblock at same time also affects this MAC, prefer weekly */
+                            if (next_affects_mac) {
+                                end_is_absolute = false;
+                                debug_info("build_periods_for_mac: MAC %u - Detected redundant absolute unblock at %ld, treating as weekly\n",
+                                           mac_index, current->event_time);
+                            }
+                        }
+                    }
+
                     uint32_t blocked_macs[] = { mac_index };
+                    /* Pass BOTH start and end types:
+                     * - start_is_absolute: if true, skip STARTING_SOON and STARTED (user pressed pause)
+                     * - end_is_absolute: if true, send NON_RECURRING_UNPAUSED instead of ENDED */
                     mac_block_period_t *new_period = create_block_period(
                         block_start,
                         current->event_time,
                         blocked_macs,
                         1,
-                        total_mac_count);
-                    
+                        total_mac_count,
+                        start_is_absolute,          /* START event type */
+                        end_is_absolute);           /* END event type (checked for redundancy) */
+
                     if (new_period) {
                         if (!periods_head) {
                             periods_head = new_period;
@@ -495,10 +580,10 @@ static mac_block_period_t* build_periods_for_mac(
                 currently_blocked = false;
             }
         }
-        
+
         current = current->next;
     }
-    
+
     return periods_head;
 }
 
@@ -537,24 +622,33 @@ static void log_timeline_summary(mac_timeline_collection_t *collection, schedule
             format_iso8601_utc(period->start_time, start_iso);
             format_iso8601_utc(period->end_time, end_iso);
 
-            debug_info("  Period %d: %s to %s\n", period_count, start_iso, end_iso);
+            debug_info("  Period %d: %s to %s (start:%s, end:%s)\n",
+                       period_count, start_iso, end_iso,
+                       period->start_is_absolute ? "absolute" : "weekly",
+                       period->end_is_absolute ? "absolute" : "weekly");
 
-            /* Show notification times if period is long enough */
+            /* Show notification times based on flags */
             bool skip_soon = (period->end_time - period->start_time) < NOTIFICATION_ADVANCE_TIME_SEC;
 
-            if (!skip_soon) {
+            if (!period->start_is_absolute && !skip_soon) {
                 format_iso8601_utc(period->start_time - NOTIFICATION_ADVANCE_TIME_SEC, start_soon_iso);
                 debug_info("    STARTING_SOON at %s\n", start_soon_iso);
             }
 
-            debug_info("    STARTED at %s\n", start_iso);
+            if (!period->start_is_absolute) {
+                debug_info("    STARTED at %s\n", start_iso);
+            }
 
-            if (!skip_soon) {
+            if (!period->end_is_absolute && !skip_soon) {
                 format_iso8601_utc(period->end_time - NOTIFICATION_ADVANCE_TIME_SEC, end_soon_iso);
                 debug_info("    ENDING_SOON at %s\n", end_soon_iso);
             }
 
-            debug_info("    ENDED at %s\n", end_iso);
+            if (period->end_is_absolute) {
+                debug_info("    NON_RECURRING_UNPAUSED at %s\n", end_iso);
+            } else {
+                debug_info("    ENDED at %s\n", end_iso);
+            }
 
             period = period->next;
         }
@@ -616,14 +710,45 @@ mac_timeline_collection_t* build_timeline_from_schedule(
                     sched_event->time,
                     week_base,
                     schedule->time_zone);
-                
-                if (event_time > now && event_time <= future_limit) {
+
+                /* For current week (week 0), include all events from current week start
+                 * to capture currently active blocks that started earlier this week
+                 * For future weeks, only include future events */
+                bool include_event = false;
+                if (week == 0) {
+                    /* Calculate start of current week (last Sunday midnight) */
+                    struct tm now_tm;
+                    if (schedule->time_zone) {
+                        set_unix_time_zone((char*)schedule->time_zone);
+                    }
+                    if (localtime_r(&now, &now_tm) != NULL) {
+                        now_tm.tm_hour = 0;
+                        now_tm.tm_min = 0;
+                        now_tm.tm_sec = 0;
+                        now_tm.tm_isdst = -1;
+                        int days_since_sunday = now_tm.tm_wday;
+                        time_t week_start = mktime(&now_tm) - (days_since_sunday * 86400);
+
+                        /* Include events from this week's start to capture active periods */
+                        if (event_time >= week_start && event_time <= future_limit) {
+                            include_event = true;
+                        }
+                    }
+                } else {
+                    /* Future weeks: only include future events */
+                    if (event_time > now && event_time <= future_limit) {
+                        include_event = true;
+                    }
+                }
+
+                if (include_event) {
                     bool is_block_start = (sched_event->block_count > 0);
                     timeline_event_t *new_event = create_timeline_event(
                         event_time,
                         is_block_start,
                         sched_event->block,
-                        sched_event->block_count);
+                        sched_event->block_count,
+                        false);  /* Weekly events */
                     
                     if (new_event) {
                         all_events = insert_event_sorted(all_events, new_event);
@@ -635,19 +760,22 @@ mac_timeline_collection_t* build_timeline_from_schedule(
         }
     }
     
-    /* Step 2: Add absolute events (filter out past events) */
+    /* Step 2: Add absolute events (include recent past to handle network latency) */
     if (schedule->absolute) {
         debug_info("build_timeline_from_schedule: Adding absolute events\n");
         
         sched_event = schedule->absolute;
         while (sched_event) {
-            if (sched_event->time > now && sched_event->time <= future_limit) {
+            /* Include events from past SCHEDULED_TIME_TOLERANCE_SEC to catch events that just happened
+             * due to network latency between cloud schedule creation and device receipt */
+            if (sched_event->time >= (now - SCHEDULED_TIME_TOLERANCE_SEC) && sched_event->time <= future_limit) {
                 bool is_block_start = (sched_event->block_count > 0);
                 timeline_event_t *new_event = create_timeline_event(
                     sched_event->time,
                     is_block_start,
                     sched_event->block,
-                    sched_event->block_count);
+                    sched_event->block_count,
+                    true);  /* Absolute events */
                 
                 if (new_event) {
                     all_events = insert_event_sorted(all_events, new_event);
@@ -812,6 +940,38 @@ bool is_device_blocked_at(
         return true;
     }
     
+    return false;
+}
+
+/**
+ * Check if MAC is blocked at specific time using timeline periods (not raw schedule)
+ * This correctly handles merged absolute+weekly periods.
+ */
+static bool is_mac_blocked_in_timeline(
+    mac_timeline_collection_t *collection,
+    uint32_t mac_index,
+    time_t check_time)
+{
+    if (!collection || !collection->timelines || mac_index >= collection->mac_count) {
+        return false;
+    }
+
+    mac_block_period_t *period = collection->timelines[mac_index].periods;
+
+    while (period) {
+        /* Check if check_time falls within this period [start, end) */
+        if (check_time >= period->start_time && check_time < period->end_time) {
+            return true;
+        }
+
+        /* Periods are sorted by time, so we can stop if we're past check_time */
+        if (period->start_time > check_time) {
+            break;
+        }
+
+        period = period->next;
+    }
+
     return false;
 }
 
@@ -1118,25 +1278,25 @@ void send_pending_notifications(
     mac_batch_t started_batch = {.count = 0};
     mac_batch_t ending_soon_batch = {.count = 0};
     mac_batch_t ended_batch = {.count = 0};
-    
+
     /* Walk through all MAC timelines */
     for (size_t mac_idx = 0; mac_idx < collection->mac_count; mac_idx++) {
         mac_block_period_t *period = collection->timelines[mac_idx].periods;
-        
+
         while (period) {
             mac_notification_state_t *state = &period->mac_states[mac_idx];
-            
+
             /* Skip past periods */
             if (period->end_time <= now) {
                 period = period->next;
                 continue;
             }
-            
+
             /* Calculate notification times */
             time_t start_soon_time = period->start_time - NOTIFICATION_ADVANCE_TIME_SEC;
             time_t end_soon_time = period->end_time - NOTIFICATION_ADVANCE_TIME_SEC;
             bool skip_soon = (period->end_time - period->start_time) < NOTIFICATION_ADVANCE_TIME_SEC;
-            
+
             /* Check and batch STARTING_SOON */
             if (!skip_soon && !state->starting_soon_sent && start_soon_time <= now) {
                 if (starting_soon_batch.count < 256) {
@@ -1144,12 +1304,12 @@ void send_pending_notifications(
                     state->starting_soon_sent = true;
                 }
             }
-            
+
             /* Check and batch STARTED */
             if (!state->started_sent && period->start_time <= now) {
                 /* Skip if we arrived late and should skip STARTED */
                 bool arrived_late = (now - period->start_time) > NOTIFICATION_ADVANCE_TIME_SEC;
-                
+
                 if (!arrived_late) {
                     if (started_batch.count < 256) {
                         started_batch.mac_indexes[started_batch.count++] = mac_idx;
@@ -1161,7 +1321,7 @@ void send_pending_notifications(
                     debug_info("send_pending_notifications: Skipping late STARTED for MAC %u\n", mac_idx);
                 }
             }
-            
+
             /* Check and batch ENDING_SOON */
             if (!skip_soon && !state->ending_soon_sent && end_soon_time <= now) {
                 if (ending_soon_batch.count < 256) {
@@ -1169,7 +1329,7 @@ void send_pending_notifications(
                     state->ending_soon_sent = true;
                 }
             }
-            
+
             /* Check and batch ENDED */
             if (!state->ended_sent && period->end_time <= now) {
                 if (ended_batch.count < 256) {
@@ -1177,11 +1337,11 @@ void send_pending_notifications(
                     state->ended_sent = true;
                 }
             }
-            
+
             period = period->next;
         }
     }
-    
+
     /* Note: In Phase 6, we'll add state-change checking and actual sending */
     /* For now, just log what would be sent */
     if (starting_soon_batch.count > 0) {
@@ -1214,119 +1374,156 @@ void send_pending_notifications_with_state_check(
     if (!collection || !collection->timelines || !schedule) {
         return;
     }
-    
+
     debug_info("send_pending_notifications_with_state_check: Checking for notifications at %ld\n", now);
-    
+
     /* Batch notifications by type and time */
     mac_batch_t starting_soon_batch = {.count = 0};
     mac_batch_t started_batch = {.count = 0};
     mac_batch_t ending_soon_batch = {.count = 0};
     mac_batch_t ended_batch = {.count = 0};
-    
+    mac_batch_t non_recurring_batch = {.count = 0};  /* For absolute schedule expiry */
+
     time_t scheduled_time = 0;  /* Scheduled time for current batch */
-    
+
     /* Walk through all MAC timelines */
     for (size_t mac_idx = 0; mac_idx < collection->mac_count; mac_idx++) {
         mac_block_period_t *period = collection->timelines[mac_idx].periods;
-        
+
         while (period) {
             mac_notification_state_t *state = &period->mac_states[mac_idx];
-            
-            /* Skip past periods */
-            if (period->end_time <= now) {
+
+            /* Skip past periods (but include exact end time for ENDED notification) */
+            if (period->end_time < now) {
                 period = period->next;
                 continue;
             }
-            
+
             /* Calculate notification times */
             time_t start_soon_time = period->start_time - NOTIFICATION_ADVANCE_TIME_SEC;
             time_t end_soon_time = period->end_time - NOTIFICATION_ADVANCE_TIME_SEC;
             bool skip_soon = (period->end_time - period->start_time) < NOTIFICATION_ADVANCE_TIME_SEC;
-            
+
             /* Check and batch STARTING_SOON with state-change checking */
             if (!skip_soon && !state->starting_soon_sent && start_soon_time <= now) {
-                /* Verify device will actually become blocked at start time */
-                bool will_be_blocked = is_device_blocked_at(schedule, mac_idx, period->start_time);
-                bool currently_blocked = is_device_blocked_at(schedule, mac_idx, now);
-                
-                if (will_be_blocked && !currently_blocked) {
-                    if (starting_soon_batch.count < 256) {
-                        starting_soon_batch.mac_indexes[starting_soon_batch.count++] = mac_idx;
-                        scheduled_time = period->start_time;
-                        state->starting_soon_sent = true;
-                    }
-                } else {
-                    /* Skip notification but mark as sent to avoid retry */
+                /* Skip if block starts from absolute (user pressed pause - they know!) */
+                if (period->start_is_absolute) {
                     state->starting_soon_sent = true;
-                    debug_info("send_pending_notifications_with_state_check: Skip STARTING_SOON for MAC %u (no state change)\n", mac_idx);
+                    debug_info("send_pending_notifications_with_state_check: Skip STARTING_SOON for MAC %u (absolute start)\n", mac_idx);
+                } else {
+                    /* Verify device will actually become blocked at start time */
+                    bool will_be_blocked = is_mac_blocked_in_timeline(collection, mac_idx, period->start_time);
+                    bool currently_blocked = is_mac_blocked_in_timeline(collection, mac_idx, now);
+
+                    if (will_be_blocked && !currently_blocked) {
+                        if (starting_soon_batch.count < 256) {
+                            starting_soon_batch.mac_indexes[starting_soon_batch.count++] = mac_idx;
+                            scheduled_time = period->start_time;
+                            state->starting_soon_sent = true;
+                        }
+                    } else {
+                        /* Skip notification but mark as sent to avoid retry */
+                        state->starting_soon_sent = true;
+                        debug_info("send_pending_notifications_with_state_check: Skip STARTING_SOON for MAC %u (no state change)\n", mac_idx);
+                    }
                 }
             }
-            
+
             /* Check and batch STARTED with state-change checking */
             if (!state->started_sent && period->start_time <= now) {
-                /* Skip if we arrived late */
-                bool arrived_late = (now - period->start_time) > NOTIFICATION_ADVANCE_TIME_SEC;
-                
-                if (!arrived_late) {
-                    /* Verify device actually became blocked */
-                    bool is_blocked = is_device_blocked_at(schedule, mac_idx, now);
-                    
-                    if (is_blocked) {
-                        if (started_batch.count < 256) {
-                            started_batch.mac_indexes[started_batch.count++] = mac_idx;
-                            scheduled_time = period->start_time;
+                /* Skip if block starts from absolute (user pressed pause - they know!) */
+                if (period->start_is_absolute) {
+                    state->started_sent = true;
+                    debug_info("send_pending_notifications_with_state_check: Skip STARTED for MAC %u (absolute start)\n", mac_idx);
+                } else {
+                    /* Skip if we arrived late */
+                    bool arrived_late = (now - period->start_time) > NOTIFICATION_ADVANCE_TIME_SEC;
+
+                    if (!arrived_late) {
+                        /* Verify device actually became blocked */
+                        bool is_blocked = is_mac_blocked_in_timeline(collection, mac_idx, now);
+
+                        if (is_blocked) {
+                            if (started_batch.count < 256) {
+                                started_batch.mac_indexes[started_batch.count++] = mac_idx;
+                                scheduled_time = period->start_time;
+                                state->started_sent = true;
+                            }
+                        } else {
                             state->started_sent = true;
+                            debug_info("send_pending_notifications_with_state_check: Skip STARTED for MAC %u (not blocked)\n", mac_idx);
                         }
                     } else {
                         state->started_sent = true;
-                        debug_info("send_pending_notifications_with_state_check: Skip STARTED for MAC %u (not blocked)\n", mac_idx);
+                        debug_info("send_pending_notifications_with_state_check: Skip late STARTED for MAC %u\n", mac_idx);
                     }
-                } else {
-                    state->started_sent = true;
-                    debug_info("send_pending_notifications_with_state_check: Skip late STARTED for MAC %u\n", mac_idx);
                 }
             }
-            
+
             /* Check and batch ENDING_SOON with state-change checking */
             if (!skip_soon && !state->ending_soon_sent && end_soon_time <= now) {
-                /* Verify device will actually become unblocked at end time */
-                bool currently_blocked = is_device_blocked_at(schedule, mac_idx, now);
-                bool will_be_blocked = is_device_blocked_at(schedule, mac_idx, period->end_time);
-                
-                if (currently_blocked && !will_be_blocked) {
-                    if (ending_soon_batch.count < 256) {
-                        ending_soon_batch.mac_indexes[ending_soon_batch.count++] = mac_idx;
-                        scheduled_time = period->end_time;
-                        state->ending_soon_sent = true;
-                    }
-                } else {
+                /* Skip if block ends by absolute (will send NON_RECURRING_UNPAUSED instead) */
+                if (period->end_is_absolute) {
                     state->ending_soon_sent = true;
-                    debug_info("send_pending_notifications_with_state_check: Skip ENDING_SOON for MAC %u (no state change)\n", mac_idx);
+                    debug_info("send_pending_notifications_with_state_check: Skip ENDING_SOON for MAC %u (absolute end)\n", mac_idx);
+                } else {
+                    /* Verify device will actually become unblocked at end time */
+                    bool currently_blocked = is_mac_blocked_in_timeline(collection, mac_idx, now);
+                    bool will_be_blocked = is_mac_blocked_in_timeline(collection, mac_idx, period->end_time);
+
+                    if (currently_blocked && !will_be_blocked) {
+                        if (ending_soon_batch.count < 256) {
+                            ending_soon_batch.mac_indexes[ending_soon_batch.count++] = mac_idx;
+                            scheduled_time = period->end_time;
+                            state->ending_soon_sent = true;
+                        }
+                    } else {
+                        state->ending_soon_sent = true;
+                        debug_info("send_pending_notifications_with_state_check: Skip ENDING_SOON for MAC %u (no state change)\n", mac_idx);
+                    }
                 }
             }
-            
-            /* Check and batch ENDED with state-change checking */
+
+            /* Check and batch ENDED or NON_RECURRING_UNPAUSED */
             if (!state->ended_sent && period->end_time <= now) {
-                /* Verify device actually became unblocked */
-                bool was_blocked = is_device_blocked_at(schedule, mac_idx, period->end_time - 1);
-                bool is_blocked = is_device_blocked_at(schedule, mac_idx, now);
-                
-                if (was_blocked && !is_blocked) {
-                    if (ended_batch.count < 256) {
-                        ended_batch.mac_indexes[ended_batch.count++] = mac_idx;
-                        scheduled_time = period->end_time;
+                if (period->end_is_absolute) {
+                    /* Absolute pause expiry - send NON_RECURRING_UNPAUSED */
+                    bool was_blocked = is_mac_blocked_in_timeline(collection, mac_idx, period->end_time - 1);
+                    bool is_blocked = is_mac_blocked_in_timeline(collection, mac_idx, now);
+
+                    if (was_blocked && !is_blocked) {
+                        /* Send NON_RECURRING_UNPAUSED for natural absolute expiry */
+                        if (non_recurring_batch.count < 256) {
+                            non_recurring_batch.mac_indexes[non_recurring_batch.count++] = mac_idx;
+                            scheduled_time = period->end_time;
+                            state->ended_sent = true;
+                        }
+                    } else {
                         state->ended_sent = true;
+                        debug_info("send_pending_notifications_with_state_check: Skip NON_RECURRING for MAC %u (still blocked)\n", mac_idx);
                     }
                 } else {
-                    state->ended_sent = true;
-                    debug_info("send_pending_notifications_with_state_check: Skip ENDED for MAC %u (no state change)\n", mac_idx);
+                    /* Weekly downtime end - send ENDED */
+                    bool was_blocked = is_mac_blocked_in_timeline(collection, mac_idx, period->end_time - 1);
+                    bool is_blocked = is_mac_blocked_in_timeline(collection, mac_idx, now);
+
+                    if (was_blocked && !is_blocked) {
+                        if (ended_batch.count < 256) {
+                            ended_batch.mac_indexes[ended_batch.count++] = mac_idx;
+                            scheduled_time = period->end_time;
+                            state->ended_sent = true;
+                        }
+                    } else {
+                        state->ended_sent = true;
+                        debug_info("send_pending_notifications_with_state_check: Skip ENDED for MAC %u (no state change)\n", mac_idx);
+                    }
                 }
             }
-            
+
             period = period->next;
         }
     }
-    
+
     /* Send batched notifications */
     if (starting_soon_batch.count > 0) {
         debug_info("send_pending_notifications_with_state_check: Sending STARTING_SOON for %zu MACs\n",
@@ -1339,7 +1536,7 @@ void send_pending_notifications_with_state_check(
             collection->time_zone,
             schedule);
     }
-    
+
     if (started_batch.count > 0) {
         debug_info("send_pending_notifications_with_state_check: Sending STARTED for %zu MACs\n",
                    started_batch.count);
@@ -1351,7 +1548,7 @@ void send_pending_notifications_with_state_check(
             collection->time_zone,
             schedule);
     }
-    
+
     if (ending_soon_batch.count > 0) {
         debug_info("send_pending_notifications_with_state_check: Sending ENDING_SOON for %zu MACs\n",
                    ending_soon_batch.count);
@@ -1363,7 +1560,7 @@ void send_pending_notifications_with_state_check(
             collection->time_zone,
             schedule);
     }
-    
+
     if (ended_batch.count > 0) {
         debug_info("send_pending_notifications_with_state_check: Sending ENDED for %zu MACs\n",
                    ended_batch.count);
@@ -1372,6 +1569,18 @@ void send_pending_notifications_with_state_check(
             scheduled_time,
             ended_batch.mac_indexes,
             ended_batch.count,
+            collection->time_zone,
+            schedule);
+    }
+
+    if (non_recurring_batch.count > 0) {
+        debug_info("send_pending_notifications_with_state_check: Sending NON_RECURRING_UNPAUSED for %zu MACs\n",
+                   non_recurring_batch.count);
+        send_notification_event(
+            NOTIFY_NON_RECURRING_UNPAUSED,
+            scheduled_time,
+            non_recurring_batch.mac_indexes,
+            non_recurring_batch.count,
             collection->time_zone,
             schedule);
     }
@@ -1386,9 +1595,9 @@ void process_recent_absolute_events(
     if (!schedule || !schedule->absolute) {
         return;
     }
-    
+
     debug_info("process_recent_absolute_events: Checking for recent unblock events\n");
-    
+
     /* Walk through absolute events looking for recent unblocks */
     event = schedule->absolute;
     while (event) {
@@ -1396,14 +1605,14 @@ void process_recent_absolute_events(
         if (event->block_count == 0 && 
             event->time <= now && 
             (now - event->time) < SCHEDULED_TIME_TOLERANCE_SEC) {
-            
+
             debug_info("process_recent_absolute_events: Found recent unblock at %ld\n", 
                        event->time);
             
             /* This is handled by classify_absolute_unblock in Phase 6 integration */
             /* For now, just log it */
         }
-        
+
         event = event->next;
     }
 }
@@ -1417,11 +1626,11 @@ static mac_block_period_t* find_period_containing_time(
     time_t target_time)
 {
     mac_block_period_t *period;
-    
+
     if (!collection || mac_index >= collection->mac_count) {
         return NULL;
     }
-    
+
     period = collection->timelines[mac_index].periods;
     while (period) {
         if (target_time >= period->start_time && target_time <= period->end_time) {
@@ -1429,7 +1638,7 @@ static mac_block_period_t* find_period_containing_time(
         }
         period = period->next;
     }
-    
+
     return NULL;
 }
 
@@ -1439,17 +1648,17 @@ unblock_type_t classify_absolute_unblock(
     time_t now)
 {
     schedule_event_t *event;
-    
+
     if (!schedule || !schedule->absolute) {
         return UNBLOCK_UNKNOWN;
     }
-    
+
     /* Find the unblock event in the absolute schedule */
     event = schedule->absolute;
     while (event) {
         if (event->block_count == 0 && event->time == unblock_time) {
             /* Found the unblock event */
-            
+
             /* Check if this is a recent event */
             if ((now - unblock_time) > SCHEDULED_TIME_TOLERANCE_SEC) {
                 /* Too old to be actionable */
@@ -1457,18 +1666,18 @@ unblock_type_t classify_absolute_unblock(
                            now - unblock_time);
                 return UNBLOCK_TOO_OLD;
             }
-            
+
             /* Need timeline to determine if natural expiry or manual */
             /* This will be fully implemented in Phase 6 when timeline is available */
             debug_info("classify_absolute_unblock: Found recent unblock at %ld\n", unblock_time);
-            
+
             /* For now, return as recent */
             return UNBLOCK_RECENT_ABSOLUTE;
         }
-        
+
         event = event->next;
     }
-    
+
     return UNBLOCK_UNKNOWN;
 }
 
@@ -1485,42 +1694,42 @@ unblock_type_t classify_absolute_unblock_with_timeline(
 {
     mac_block_period_t *period;
     time_t time_diff;
-    
+
     if (!collection || !schedule) {
         return UNBLOCK_UNKNOWN;
     }
-    
+
     /* Check if recent enough */
     if ((now - unblock_time) > SCHEDULED_TIME_TOLERANCE_SEC) {
         return UNBLOCK_TOO_OLD;
     }
-    
+
     /* Find the period that was supposed to contain this time */
     period = find_period_containing_time(collection, mac_index, unblock_time);
-    
+
     if (!period) {
         /* No scheduled period found - this is unexpected */
         debug_info("classify_absolute_unblock_with_timeline: No period found for MAC %u at %ld\n",
                    mac_index, unblock_time);
         return UNBLOCK_UNKNOWN;
     }
-    
+
     /* Compare actual unblock time vs scheduled end time */
     time_diff = unblock_time - period->end_time;
-    
+
     if (time_diff >= -SCHEDULED_TIME_TOLERANCE_SEC && 
         time_diff <= SCHEDULED_TIME_TOLERANCE_SEC) {
         /* Within tolerance = natural expiry */
         debug_info("classify_absolute_unblock_with_timeline: Natural expiry for MAC %u "
                    "(diff=%ld sec)\n", mac_index, time_diff);
-        
+
         /* Check if device will remain blocked by weekly schedule */
         if (is_device_blocked_at(schedule, mac_index, unblock_time)) {
             debug_info("classify_absolute_unblock_with_timeline: Device remains blocked, "
                        "skip notification\n");
             return UNBLOCK_NATURAL_NO_NOTIFY;
         }
-        
+
         return UNBLOCK_NATURAL_EXPIRY;
     } else if (unblock_time < period->end_time) {
         /* Unblocked before scheduled end = manual early wakeup */
@@ -1528,7 +1737,7 @@ unblock_type_t classify_absolute_unblock_with_timeline(
                    "(%ld sec early)\n", mac_index, period->end_time - unblock_time);
         return UNBLOCK_MANUAL_EARLY;
     }
-    
+
     /* Shouldn't happen - unblock after scheduled end */
     debug_info("classify_absolute_unblock_with_timeline: Late unblock? (diff=%ld)\n", time_diff);
     return UNBLOCK_UNKNOWN;

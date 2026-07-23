@@ -84,6 +84,9 @@ typedef struct mac_block_period {
     
     mac_notification_state_t *mac_states;   /* Notification state per MAC (array) */
     
+    bool start_is_absolute;                 /* true = started by absolute, false = started by weekly */
+    bool end_is_absolute;                   /* true = ends by absolute, false = ends by weekly */
+
     struct mac_block_period *next;          /* Next period in linked list */
 } mac_block_period_t;
 
