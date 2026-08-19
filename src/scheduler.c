@@ -309,6 +309,28 @@ void *scheduler_thread(void *args)
                 current_unix_time);
         }
 
+        /* Auto-rebuild timeline if it's getting old (for weekly recurring schedules) */
+        if( notification_timeline && current_schedule ) {
+            time_t timeline_age = current_unix_time - notification_timeline->created_at;
+            time_t rebuild_threshold = 10 * 86400;  /* Rebuild after 10 days */
+
+            if( timeline_age > rebuild_threshold ) {
+                debug_info("scheduler_thread(): Timeline is %ld days old, rebuilding for fresh notifications\n",
+                          timeline_age / 86400);
+                destroy_timeline_collection(notification_timeline);
+                notification_timeline = build_timeline_from_schedule(
+                    current_schedule,
+                    current_unix_time,
+                    MAX_WEEKS_AHEAD);
+
+                if( notification_timeline ) {
+                    debug_info("scheduler_thread(): Timeline auto-rebuilt successfully\n");
+                } else {
+                    debug_error("scheduler_thread(): Failed to auto-rebuild timeline\n");
+                }
+            }
+        }
+
         /* Report if it is time. */
         if( next_report_time <= current_unix_time ) {
             aker_metrics_report(current_unix_time);
@@ -340,7 +362,9 @@ void *scheduler_thread(void *args)
             time_t next_notification = get_next_notification_time(notification_timeline, current_unix_time);
             if( next_notification < tm.tv_sec ) {
                 tm.tv_sec = next_notification;
-                debug_info("scheduler_thread(): Next wake for notification at %ld\n", next_notification);
+                char next_iso[32];
+                format_iso8601_utc(next_notification, next_iso);
+                debug_print("scheduler_thread(): Next wake for notification at %s (unix:%ld)\n", next_iso, next_notification);
             }
         }
 

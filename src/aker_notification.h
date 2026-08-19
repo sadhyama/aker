@@ -185,18 +185,7 @@ time_t get_next_notification_time(
 );
 
 /**
- * Send all pending notifications at current time
- * 
- * @param collection  The timeline collection
- * @param now         Current Unix time
- */
-void send_pending_notifications(
-    mac_timeline_collection_t *collection,
-    time_t now
-);
-
-/**
- * Enhanced version: Send pending notifications with state-change checking
+ * Send pending notifications with state-change checking
  * This version performs actual notification sending with state verification
  * 
  * @param collection  The timeline collection
@@ -205,53 +194,6 @@ void send_pending_notifications(
  */
 void send_pending_notifications_with_state_check(
     mac_timeline_collection_t *collection,
-    schedule_t *schedule,
-    time_t now
-);
-
-/**
- * Process recent absolute events (< 60 sec old)
- * Detects manual unpause and sends appropriate notifications
- * 
- * @param schedule  The schedule with absolute events
- * @param now       Current Unix time
- */
-void process_recent_absolute_events(
-    schedule_t *schedule,
-    time_t now
-);
-
-/**
- * Classify absolute unblock event type
- * 
- * @param unblock_time  When the unblock happens
- * @param schedule      The current schedule
- * @param now           Current Unix time
- * 
- * @return Classification of unblock event
- */
-unblock_type_t classify_absolute_unblock(
-    time_t unblock_time,
-    schedule_t *schedule,
-    time_t now
-);
-
-/**
- * Enhanced version: Classify with timeline comparison
- * Compares actual unblock time against timeline to detect manual vs natural expiry
- * 
- * @param collection    The timeline collection
- * @param mac_index     Index of MAC in schedule->macs array
- * @param unblock_time  When the unblock happens
- * @param schedule      The current schedule
- * @param now           Current Unix time
- * 
- * @return Classification of unblock event
- */
-unblock_type_t classify_absolute_unblock_with_timeline(
-    mac_timeline_collection_t *collection,
-    uint32_t mac_index,
-    time_t unblock_time,
     schedule_t *schedule,
     time_t now
 );

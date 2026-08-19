@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "time.h"
 #include "aker_log.h"
@@ -87,6 +88,7 @@ int set_unix_time_zone (const char *time_zone)
    time_t mtt;
    char ftime[10];
    int rv = 0;
+   static char last_tz[64] = {0};  /* Track last logged timezone */
 
    setenv("TZ", time_zone, 1);
    tzset();
@@ -99,7 +101,12 @@ int set_unix_time_zone (const char *time_zone)
        debug_error("set_unix_time_zone() error, TZ = %s\n", time_zone);
    }
 
-   debug_info("time_zone: %s is %s\n", time_zone, ftime);
+   /* Only log on first call or timezone change */
+   if (last_tz[0] == '\0' || strncmp(last_tz, time_zone, sizeof(last_tz)) != 0) {
+       debug_info("time_zone: %s is %s\n", time_zone, ftime);
+       strncpy(last_tz, time_zone, sizeof(last_tz) - 1);
+       last_tz[sizeof(last_tz) - 1] = '\0';
+   }
    
    return rv;
 }
