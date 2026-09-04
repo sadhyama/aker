@@ -697,7 +697,7 @@ static void log_timeline_summary(mac_timeline_collection_t *collection, schedule
         /* Check each MAC to see if blocking starts or ends */
         for (size_t mac_idx = 0; mac_idx < schedule->mac_count && mac_idx < 256; mac_idx++) {
             bool is_in_event = false;
-            if (weekly_event->block && weekly_event->block_count > 0) {
+            if (weekly_event->block_count > 0) {
                 for (size_t i = 0; i < weekly_event->block_count; i++) {
                     if (weekly_event->block[i] == mac_idx) {
                         is_in_event = true;
@@ -820,7 +820,7 @@ static void log_timeline_summary(mac_timeline_collection_t *collection, schedule
         /* Check for blocking start/end */
         for (size_t mac_idx = 0; mac_idx < schedule->mac_count && mac_idx < 256; mac_idx++) {
             bool is_in_event = false;
-            if (abs_event->block && abs_event->block_count > 0) {
+            if (abs_event->block_count > 0) {
                 for (size_t i = 0; i < abs_event->block_count; i++) {
                     if (abs_event->block[i] == mac_idx) {
                         is_in_event = true;
