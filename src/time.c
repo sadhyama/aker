@@ -89,11 +89,8 @@ int set_unix_time_zone (const char *time_zone)
    char ftime2[10];
    int rv = 0;
 
-   if(strcmp(time_zone, "US/Pacific") != 0)
-   {
-	setenv("TZ", time_zone, 1);
-	tzset();
-   }
+   setenv("TZ", time_zone, 1);
+   tzset();
    mtt = time(NULL);
    mt = localtime(&mtt);
    debug_info("mt->tm_zone = %s\n", mt->tm_zone);
